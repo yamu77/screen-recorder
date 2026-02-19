@@ -24,3 +24,6 @@ log = "0.4"
 tauri = { version = "2.10.0", features = [] }
 tauri-plugin-log = "2"
 xcap = "0.8.2"
+image = "0.25.6"
+windows-capture = "1.5.0"
+chrono = "0.4.43"
