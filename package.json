@@ -7,15 +7,20 @@
     "build": "next build",
     "start": "next start",
     "lint": "biome check",
-    "format": "biome format --write"
+    "format": "biome format --write",
+    "add": "liftkit add",
+    "tauri": "tauri"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
     "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.0",
+    "@chainlift/liftkit": "^0.2.0",
+    "@tauri-apps/cli": "^2.10.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
