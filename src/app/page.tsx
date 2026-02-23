@@ -1,4 +1,4 @@
-"use client"; // Next.jsで状態管理を使うためのおまじない
+"use client";
 
 // biome-ignore assist/source/organizeImports: <explanation>
 import { useState, useEffect } from "react";
@@ -21,7 +21,6 @@ import {
 
 const handleCapture = async (title: string) => {
   try {
-    // コマンド名と渡す引数を修正
     const result = await invoke<string>("capture_selected_window", {
       title: title,
     });
@@ -33,11 +32,43 @@ const handleCapture = async (title: string) => {
   }
 };
 
+const handleStartRecord = async (title: string) => {
+  try {
+    const result = await invoke<string>("start_record_window", {
+      title: title,
+    });
+    console.log(result);
+    alert(result);
+  } catch (err) {
+    console.error("録画失敗:", err);
+    alert("失敗しちゃったみたい…");
+  }
+};
+
+const handleStopRecord = async () => {
+  try {
+    const result = await invoke<string>("stop_record_window");
+    console.log(result);
+    alert(result);
+  } catch (err) {
+    console.error("録画停止失敗:", err);
+    alert("失敗しちゃったみたい…");
+  }
+};
+
+const checkAudio = async () => {
+  try {
+    const result = await invoke<string>("test_audio_device");
+    alert(result);
+  } catch (err) {
+    alert("エラー: " + err);
+  }
+};
+
 export default function Home() {
   const [windows, setWindows] = useState<WindowInfo[]>([]);
   const [selectedWindowId, setSelectedWindowId] = useState("");
   useEffect(() => {
-    // Rustの 'get_windows' コマンドを呼び出す
     invoke<WindowInfo[]>("get_windows")
       .then((data) => {
         setWindows(data);
@@ -82,6 +113,47 @@ export default function Home() {
             color="primary"
             startIcon="video"
             endIcon="video"
+            onClick={() => {
+              if (!selectedWindowId) {
+                alert("先にウィンドウを選んで。");
+                return;
+              }
+              const targetWindow = windows.find(
+                (w) => String(w.id) === selectedWindowId,
+              );
+              if (targetWindow) {
+                handleStartRecord(targetWindow.title);
+              }
+            }}
+          />
+          <Button
+            label="録画停止"
+            variant="fill"
+            size="lg"
+            color="primary"
+            startIcon="video"
+            endIcon="video"
+            onClick={() => {
+              if (!selectedWindowId) {
+                alert("先にウィンドウを選んで。");
+                return;
+              }
+              const targetWindow = windows.find(
+                (w) => String(w.id) === selectedWindowId,
+              );
+              if (targetWindow) {
+                handleStopRecord();
+              }
+            }}
+          />
+          <Button
+            label="音声デバイス確認"
+            variant="fill"
+            size="lg"
+            color="primary"
+            startIcon="video"
+            endIcon="video"
+            onClick={checkAudio}
           />
         </div>
         <Select
