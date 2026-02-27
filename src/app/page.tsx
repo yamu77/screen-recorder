@@ -58,8 +58,7 @@ const handleStopRecord = async () => {
 
 const checkAudio = async () => {
   try {
-    const result = await invoke<string>("test_audio_device");
-    alert(result);
+    const result = await invoke<string>("test_audio_record");
   } catch (err) {
     alert("エラー: " + err);
   }

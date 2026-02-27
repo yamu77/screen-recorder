@@ -4,8 +4,10 @@ use serde::Serialize;
 use tauri::command;
 use xcap::Window;
 use chrono::Local;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use cpal::traits::{DeviceTrait, HostTrait};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use hound::{SampleFormat, WavSpec};
+use std::time::Duration;
 
 use windows_capture::{
     capture::{Context, GraphicsCaptureApiHandler},
@@ -179,45 +181,120 @@ fn start_record_window(title: String, state: tauri::State<'_, RecordState>) -> R
     if state.is_recording.load(Ordering::Relaxed) {
         return Err("すでに録画中みたい…".to_string());
     }
-    
+
     // 録画中フラグをONにする
     state.is_recording.store(true, Ordering::Relaxed);
     let is_recording_clone = Arc::clone(&state.is_recording);
 
     // スレッドを切り離して、裏側で勝手にやってもらう
     std::thread::spawn(move || {
-        let window = match WgcWindow::from_contains_name(&title) {
-            Ok(w) => w,
-            Err(_) => {
+        // 保存先を一時フォルダ（Temp）にしてホットリロードを回避
+        let temp_dir = std::env::temp_dir();
+        let video_path = temp_dir.join("temp_video.mp4");
+        let audio_path = temp_dir.join("temp_audio.wav");
+
+        // 保存先
+        let now = chrono::Local::now();
+        let final_filename = format!("Record_{}.mp4", now.format("%Y%m%d_%H%M%S"));
+        let final_dir = dirs::video_dir().unwrap_or(temp_dir.clone());
+        let final_path = final_dir.join(final_filename);
+
+        // 音声
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
                 is_recording_clone.store(false, Ordering::Relaxed);
                 return;
             }
         };
-        let now = chrono::Local::now();
-        let filename = format!("Record_{}.mp4", now.format("%Y%m%d_%H%M%S"));
-
-        let settings = Settings::new(
-            window,
-            CursorCaptureSettings::Default,
-            DrawBorderSettings::WithoutBorder,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
-            DirtyRegionSettings::Default,
-            ColorFormat::Rgba8,
-            RecorderFlags {
-                filename,
-                is_recording: is_recording_clone.clone(),
-            },
-        );
-
-        // 録画開始（止まるまでここでブロックされる）
-        let _ = VideoRecorderHandler::start(settings);
+        let config = device.default_output_config().unwrap();
+        let spec = hound::WavSpec {
+            channels: config.channels(),
+            sample_rate: config.sample_rate(),
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
         
-        // 終わったらフラグをOFFに戻す
-        is_recording_clone.store(false, Ordering::Relaxed);
+        let writer = hound::WavWriter::create(&audio_path, spec).unwrap();
+        let writer = Arc::new(Mutex::new(writer));
+        let writer_clone = Arc::clone(&writer);
+
+        let stream_config: cpal::StreamConfig = config.into();
+        let stream = device.build_input_stream(
+            &stream_config,
+            move |data: &[f32], _: &_| {
+                if let Ok(mut w) = writer_clone.lock() {
+                    for &sample in data {
+                        let _ = w.write_sample(sample);
+                    }
+                }
+            },
+            |err| eprintln!("音声エラー: {}", err),
+            None,
+        ).unwrap();
+        stream.play().unwrap();
+
+        // 映像
+        let is_recording_video = Arc::clone(&is_recording_clone);
+        let video_path_str = video_path.to_string_lossy().to_string();
+        let title_clone = title.clone();
+        
+        let video_thread = std::thread::spawn(move || {
+            let window = match WgcWindow::from_contains_name(&title_clone) {
+                Ok(w) => w,
+                Err(_) => {
+                    is_recording_video.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            let settings = Settings::new(
+                window,
+                CursorCaptureSettings::Default,
+                DrawBorderSettings::WithoutBorder,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                ColorFormat::Rgba8,
+                RecorderFlags {
+                    filename: video_path_str,
+                    is_recording: is_recording_video,
+                },
+            );
+
+            let _ = VideoRecorderHandler::start(settings);
+        });
+
+        // 待機ループ　FEから停止されるまで
+        while is_recording_clone.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // 録画終了
+        drop(stream);
+        drop(writer);
+
+        let _ = video_thread.join(); // 映像の終了を確実に待つ
+
+        // 保存
+        let _ = std::process::Command::new("ffmpeg")
+            .arg("-y") // 上書き許可
+            .arg("-i").arg(&video_path)
+            .arg("-i").arg(&audio_path)
+            .arg("-c:v").arg("copy")
+            .arg("-c:a").arg("aac")
+            .arg(&final_path)
+            .output(); // コマンド実行！
+
+        // 使い終わった一時ファイルを削除
+        let _ = std::fs::remove_file(video_path);
+        let _ = std::fs::remove_file(audio_path);
+        
+        println!("録画完了: {:?}", final_path);
     });
 
-    Ok("録画を開始したよ".to_string())
+    Ok("録画を開始したよ。終わったらPCの「ビデオ」フォルダを確認してみて。".to_string())
 }
 
 // 録画停止
@@ -228,19 +305,57 @@ fn stop_record_window(state: tauri::State<'_, RecordState>) -> Result<String, St
 }
 
 #[command]
-fn test_audio_device() -> Result<String, String> {
+fn test_audio_record() -> Result<String, String> {
     let host = cpal::default_host();
-    
-    // システムの標準スピーカー（出力デバイス）を取得
-    let device = host.default_output_device()
-        .ok_or_else(|| "スピーカー（出力デバイス）が見つからないみたい…".to_string())?;
-        
-    // スピーカーの設定を取得
+    // PCのメインスピーカーを取得
+    let device = host.default_output_device().ok_or("スピーカーが見つからないみたい")?;
     let config = device.default_output_config().map_err(|e| e.to_string())?;
+
+    // WAVファイルの設定（スピーカーの設定に合わせる）
+    let spec = WavSpec {
+        channels: config.channels(),
+        sample_rate: config.sample_rate(),
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+
+    // 保存するファイルを作成
+    let writer = hound::WavWriter::create("test_audio.wav", spec).map_err(|e| e.to_string())?;
+    // 裏側のスレッド（録音部屋）に渡すために Arc<Mutex> で包む
+    let writer = Arc::new(Mutex::new(writer));
+    let writer_clone = Arc::clone(&writer);
+
+    let stream_config = config.clone().into();
+
+    // 出力デバイス（スピーカー）の音を拾う「ループバック録音」を開始
+    let stream = device.build_input_stream(
+        &stream_config,
+        move |data: &[f32], _: &_| {
+            // 音の波形データが流れてくるたびに、WAVファイルに書き込む
+            if let Ok(mut w) = writer_clone.lock() {
+                for &sample in data {
+                    let _ = w.write_sample(sample);
+                }
+            }
+        },
+        |err| eprintln!("音声エラー: {}", err),
+        None,
+    ).map_err(|e| e.to_string())?;
+
+    stream.play().map_err(|e| e.to_string())?;
+
+    // 【テスト用】5秒間待機（この間にPCから鳴っている音が録音される）
+    std::thread::sleep(Duration::from_secs(5));
+
+    // 5秒経ったら録音ストリームを閉じる
+    drop(stream);
     
-    let device_name = device.name().unwrap_or_else(|_| "不明なデバイス".to_string());
-    
-    Ok(format!("音声デバイス確認OK: {} (サンプルレート: {}Hz)", device_name, config.sample_rate()))
+    // 最後にファイルの「フタ」を確実に閉める
+    if let Ok(mut w) = writer.lock() {
+        let _ = w.flush();
+    }
+
+    Ok("test_audio.wav に5秒間の音声を保存したよ".to_string())
 }
 
 pub fn run() {
@@ -258,7 +373,7 @@ pub fn run() {
       }
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_windows, capture_selected_window, start_record_window, stop_record_window, test_audio_device])
+    .invoke_handler(tauri::generate_handler![get_windows, capture_selected_window, start_record_window, stop_record_window, test_audio_record])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
