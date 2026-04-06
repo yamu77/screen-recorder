@@ -10,7 +10,9 @@ type WindowInfo = {
   id: number;
   title: string;
   app_name: string;
+  pid: number;
 };
+
 import styles from "./page.module.css";
 import {
   Select,
@@ -32,10 +34,11 @@ const handleCapture = async (title: string) => {
   }
 };
 
-const handleStartRecord = async (title: string) => {
+const handleStartRecord = async (title: string, pid: number) => {
   try {
     const result = await invoke<string>("start_record_window", {
       title: title,
+      pid: pid,
     });
     console.log(result);
     alert(result);
@@ -121,7 +124,7 @@ export default function Home() {
                 (w) => String(w.id) === selectedWindowId,
               );
               if (targetWindow) {
-                handleStartRecord(targetWindow.title);
+                handleStartRecord(targetWindow.title, targetWindow.pid);
               }
             }}
           />

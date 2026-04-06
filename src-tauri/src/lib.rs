@@ -1,4 +1,6 @@
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
 use serde::Serialize;
 use tauri::command;
@@ -20,6 +22,14 @@ use windows_capture::{
     window::Window as WgcWindow,
     encoder::{AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder},
 };
+
+#[derive(Serialize)]
+struct WindowInfo {
+    id: u32,
+    title: String,
+    app_name: String,
+    pid: u32,
+}
 
 // 1フレームだけ受信して保存する
 struct SnapshotHandler {
@@ -117,29 +127,28 @@ impl GraphicsCaptureApiHandler for VideoRecorderHandler {
     }
 }
 
-#[derive(Serialize)]
-struct WindowInfo {
-    id: u32,
-    title: String,
-    app_name: String,
-}
+
 
 #[command]
 fn get_windows() -> Result<Vec<WindowInfo>, String> {
     let windows = Window::all().map_err(|e| e.to_string())?;
     let mut result = Vec::new();
     for window in windows {
-        // unwrap_or_default() を使って、失敗した場合は空文字にする
         let title = window.title().unwrap_or_default();
         let app_name = window.app_name().unwrap_or_default();
-        // 失敗した場合はIDを0にする
         let id = window.id().unwrap_or(0);
-        // タイトルが空じゃないものだけをリストに追加
         if !title.is_empty() {
+            // ウィンドウIDからプロセスID（PID）を取得する
+            let mut pid = 0;
+            unsafe {
+                GetWindowThreadProcessId(HWND(id as _), Some(&mut pid));
+            }
+
             result.push(WindowInfo {
                 id,
                 title,
                 app_name,
+                pid,
             });
         }
     }
@@ -176,7 +185,7 @@ fn capture_selected_window(title: String) -> Result<String, String> {
 
 // 録画開始
 #[command]
-fn start_record_window(title: String, state: tauri::State<'_, RecordState>) -> Result<String, String> {
+fn start_record_window(title: String,pid: u32, state: tauri::State<'_, RecordState>) -> Result<String, String> {
     // すでに録画中なら弾く
     if state.is_recording.load(Ordering::Relaxed) {
         return Err("すでに録画中みたい…".to_string());
@@ -199,41 +208,93 @@ fn start_record_window(title: String, state: tauri::State<'_, RecordState>) -> R
         let final_dir = dirs::video_dir().unwrap_or(temp_dir.clone());
         let final_path = final_dir.join(final_filename);
 
-        // 音声
-        let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                is_recording_clone.store(false, Ordering::Relaxed);
-                return;
-            }
-        };
-        let config = device.default_output_config().unwrap();
-        let spec = hound::WavSpec {
-            channels: config.channels(),
-            sample_rate: config.sample_rate(),
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
+        // --- ここから書き換える ---
+        let is_recording_audio = Arc::clone(&is_recording_clone);
+        let audio_path_clone = audio_path.clone();
         
-        let writer = hound::WavWriter::create(&audio_path, spec).unwrap();
-        let writer = Arc::new(Mutex::new(writer));
-        let writer_clone = Arc::clone(&writer);
+        let audio_thread = std::thread::spawn(move || {
+            // WASAPIを使うためのおまじない（COM初期化）
+            let _ = wasapi::initialize_mta().ok();
 
-        let stream_config: cpal::StreamConfig = config.into();
-        let stream = device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _: &_| {
-                if let Ok(mut w) = writer_clone.lock() {
-                    for &sample in data {
-                        let _ = w.write_sample(sample);
+            // 1. 指定したPIDの音だけを拾うクライアントを作成
+            let mut client = match wasapi::AudioClient::new_application_loopback_client(pid, true) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("プロセスループバックの作成に失敗: {:?}", e);
+                    is_recording_audio.store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // 2. 音の形式（フォーマット）を決める
+            // 新しいバージョンでは DeviceEnumerator を使ってデフォルトデバイスを探すよ
+            let enumerator = wasapi::DeviceEnumerator::new().unwrap();
+            let default_device = enumerator.get_default_device(&wasapi::Direction::Render).unwrap();
+            let default_client = default_device.get_iaudioclient().unwrap();
+            let format = default_client.get_mixformat().unwrap();
+
+            // 3. クライアントを初期化（イベント駆動モード）
+            // 引数が整理されて、StreamMode の中に設定をまとめる形になったみたい
+            let mode = wasapi::StreamMode::EventsShared {
+                autoconvert: true,
+                buffer_duration_hns: 200_000, // 20ms
+            };
+            client.initialize_client(
+                &format,
+                &wasapi::Direction::Capture,
+                &mode,
+            ).unwrap();
+
+            let h_event = client.set_get_eventhandle().unwrap();
+            let capture_client = client.get_audiocaptureclient().unwrap();
+            
+            client.start_stream().unwrap();
+
+            // 4. WAVファイルを準備
+            let channels = format.get_nchannels() as u16;
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: format.get_samplespersec(),
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut writer = hound::WavWriter::create(&audio_path_clone, spec).unwrap();
+
+            // 新しいバージョンでは、データを受け取るための「空の箱（バッファ）」を先に用意しておく必要があるの
+            let bytes_per_frame = (channels as u32) * 4; // 32ビット(4バイト) × チャンネル数
+            let max_frames = client.get_buffer_size().unwrap_or(48000); // 念のため十分なサイズを確保
+            let mut buffer = vec![0u8; (max_frames * bytes_per_frame) as usize];
+
+            // 5. 録音ループ
+            while is_recording_audio.load(std::sync::atomic::Ordering::Relaxed) {
+                // 音声データが来るまで少し待つ
+                if let Ok(_) = h_event.wait_for_event(100) {
+                    // read_from_device に「空の箱」を渡して、そこに音を詰めてもらう
+                    if let Ok((frames, _info)) = capture_client.read_from_device(&mut buffer) {
+                        if frames > 0 {
+                            let bytes_read = (frames * bytes_per_frame) as usize;
+                            let read_data = &buffer[..bytes_read];
+
+                            // 読み出したバイト列(u8)を、Float(f32)の配列に変換して書き込む
+                            let float_data: &[f32] = unsafe {
+                                std::slice::from_raw_parts(
+                                    read_data.as_ptr() as *const f32,
+                                    read_data.len() / 4,
+                                )
+                            };
+                            for &sample in float_data {
+                                let _ = writer.write_sample(sample);
+                            }
+                        }
                     }
                 }
-            },
-            |err| eprintln!("音声エラー: {}", err),
-            None,
-        ).unwrap();
-        stream.play().unwrap();
+            }
+
+            // 終わったらストリームを止めてファイルを閉じる
+            let _ = client.stop_stream();
+            let _ = writer.finalize();
+        });
+        // --- ここまで ---
 
         // 映像
         let is_recording_video = Arc::clone(&is_recording_clone);
@@ -272,10 +333,8 @@ fn start_record_window(title: String, state: tauri::State<'_, RecordState>) -> R
         }
 
         // 録画終了
-        drop(stream);
-        drop(writer);
-
-        let _ = video_thread.join(); // 映像の終了を確実に待つ
+        let _ = audio_thread.join(); // 音声スレッドの終了を待つ
+        let _ = video_thread.join(); // 映像スレッドの終了を確実に待つ
 
         // 保存
         let _ = std::process::Command::new("ffmpeg")
