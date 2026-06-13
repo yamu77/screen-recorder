@@ -2,25 +2,25 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
+use chrono::Local;
 use serde::Serialize;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::command;
 use xcap::Window;
-use chrono::Local;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use hound::{SampleFormat, WavSpec};
-use std::time::Duration;
 
 use windows_capture::{
     capture::{Context, GraphicsCaptureApiHandler},
+    encoder::{AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder},
     frame::{Frame, ImageFormat},
     graphics_capture_api::InternalCaptureControl,
     settings::{
-        ColorFormat, CursorCaptureSettings, DrawBorderSettings, Settings,
-        SecondaryWindowSettings, MinimumUpdateIntervalSettings, DirtyRegionSettings
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     },
     window::Window as WgcWindow,
-    encoder::{AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder},
 };
 
 #[derive(Serialize)]
@@ -101,7 +101,7 @@ impl GraphicsCaptureApiHandler for VideoRecorderHandler {
         if self.encoder.is_none() {
             let encoder = VideoEncoder::new(
                 VideoSettingsBuilder::new(frame.width(), frame.height()),
-                AudioSettingsBuilder::default().disabled(true), 
+                AudioSettingsBuilder::default().disabled(true),
                 ContainerSettingsBuilder::default(),
                 &self.filename,
             )?;
@@ -126,8 +126,6 @@ impl GraphicsCaptureApiHandler for VideoRecorderHandler {
         Ok(())
     }
 }
-
-
 
 #[command]
 fn get_windows() -> Result<Vec<WindowInfo>, String> {
@@ -179,13 +177,17 @@ fn capture_selected_window(title: String) -> Result<String, String> {
 
     match handle.join() {
         Ok(inner_result) => inner_result,
-        Err(_) => Err("録画用の別スレッドがクラッシュしちゃったみたい…".to_string())
+        Err(_) => Err("録画用の別スレッドがクラッシュしちゃったみたい…".to_string()),
     }
 }
 
 // 録画開始
 #[command]
-fn start_record_window(title: String,pid: u32, state: tauri::State<'_, RecordState>) -> Result<String, String> {
+fn start_record_window(
+    title: String,
+    pid: u32,
+    state: tauri::State<'_, RecordState>,
+) -> Result<String, String> {
     // すでに録画中なら弾く
     if state.is_recording.load(Ordering::Relaxed) {
         return Err("すでに録画中みたい…".to_string());
@@ -211,7 +213,7 @@ fn start_record_window(title: String,pid: u32, state: tauri::State<'_, RecordSta
         // --- ここから書き換える ---
         let is_recording_audio = Arc::clone(&is_recording_clone);
         let audio_path_clone = audio_path.clone();
-        
+
         let audio_thread = std::thread::spawn(move || {
             // WASAPIを使うためのおまじない（COM初期化）
             let _ = wasapi::initialize_mta().ok();
@@ -229,7 +231,9 @@ fn start_record_window(title: String,pid: u32, state: tauri::State<'_, RecordSta
             // 2. 音の形式（フォーマット）を決める
             // 新しいバージョンでは DeviceEnumerator を使ってデフォルトデバイスを探すよ
             let enumerator = wasapi::DeviceEnumerator::new().unwrap();
-            let default_device = enumerator.get_default_device(&wasapi::Direction::Render).unwrap();
+            let default_device = enumerator
+                .get_default_device(&wasapi::Direction::Render)
+                .unwrap();
             let default_client = default_device.get_iaudioclient().unwrap();
             let format = default_client.get_mixformat().unwrap();
 
@@ -239,15 +243,13 @@ fn start_record_window(title: String,pid: u32, state: tauri::State<'_, RecordSta
                 autoconvert: true,
                 buffer_duration_hns: 200_000, // 20ms
             };
-            client.initialize_client(
-                &format,
-                &wasapi::Direction::Capture,
-                &mode,
-            ).unwrap();
+            client
+                .initialize_client(&format, &wasapi::Direction::Capture, &mode)
+                .unwrap();
 
             let h_event = client.set_get_eventhandle().unwrap();
             let capture_client = client.get_audiocaptureclient().unwrap();
-            
+
             client.start_stream().unwrap();
 
             // 4. WAVファイルを準備
@@ -300,7 +302,7 @@ fn start_record_window(title: String,pid: u32, state: tauri::State<'_, RecordSta
         let is_recording_video = Arc::clone(&is_recording_clone);
         let video_path_str = video_path.to_string_lossy().to_string();
         let title_clone = title.clone();
-        
+
         let video_thread = std::thread::spawn(move || {
             let window = match WgcWindow::from_contains_name(&title_clone) {
                 Ok(w) => w,
@@ -339,17 +341,21 @@ fn start_record_window(title: String,pid: u32, state: tauri::State<'_, RecordSta
         // 保存
         let _ = std::process::Command::new("ffmpeg")
             .arg("-y") // 上書き許可
-            .arg("-i").arg(&video_path)
-            .arg("-i").arg(&audio_path)
-            .arg("-c:v").arg("copy")
-            .arg("-c:a").arg("aac")
+            .arg("-i")
+            .arg(&video_path)
+            .arg("-i")
+            .arg(&audio_path)
+            .arg("-c:v")
+            .arg("copy")
+            .arg("-c:a")
+            .arg("aac")
             .arg(&final_path)
             .output(); // コマンド実行！
 
         // 使い終わった一時ファイルを削除
         let _ = std::fs::remove_file(video_path);
         let _ = std::fs::remove_file(audio_path);
-        
+
         println!("録画完了: {:?}", final_path);
     });
 
@@ -363,76 +369,27 @@ fn stop_record_window(state: tauri::State<'_, RecordState>) -> Result<String, St
     Ok("録画を停止したよ".to_string())
 }
 
-#[command]
-fn test_audio_record() -> Result<String, String> {
-    let host = cpal::default_host();
-    // PCのメインスピーカーを取得
-    let device = host.default_output_device().ok_or("スピーカーが見つからないみたい")?;
-    let config = device.default_output_config().map_err(|e| e.to_string())?;
-
-    // WAVファイルの設定（スピーカーの設定に合わせる）
-    let spec = WavSpec {
-        channels: config.channels(),
-        sample_rate: config.sample_rate(),
-        bits_per_sample: 32,
-        sample_format: SampleFormat::Float,
-    };
-
-    // 保存するファイルを作成
-    let writer = hound::WavWriter::create("test_audio.wav", spec).map_err(|e| e.to_string())?;
-    // 裏側のスレッド（録音部屋）に渡すために Arc<Mutex> で包む
-    let writer = Arc::new(Mutex::new(writer));
-    let writer_clone = Arc::clone(&writer);
-
-    let stream_config = config.clone().into();
-
-    // 出力デバイス（スピーカー）の音を拾う「ループバック録音」を開始
-    let stream = device.build_input_stream(
-        &stream_config,
-        move |data: &[f32], _: &_| {
-            // 音の波形データが流れてくるたびに、WAVファイルに書き込む
-            if let Ok(mut w) = writer_clone.lock() {
-                for &sample in data {
-                    let _ = w.write_sample(sample);
-                }
-            }
-        },
-        |err| eprintln!("音声エラー: {}", err),
-        None,
-    ).map_err(|e| e.to_string())?;
-
-    stream.play().map_err(|e| e.to_string())?;
-
-    // 【テスト用】5秒間待機（この間にPCから鳴っている音が録音される）
-    std::thread::sleep(Duration::from_secs(5));
-
-    // 5秒経ったら録音ストリームを閉じる
-    drop(stream);
-    
-    // 最後にファイルの「フタ」を確実に閉める
-    if let Ok(mut w) = writer.lock() {
-        let _ = w.flush();
-    }
-
-    Ok("test_audio.wav に5秒間の音声を保存したよ".to_string())
-}
-
 pub fn run() {
-  tauri::Builder::default()
-    .manage(RecordState {
+    tauri::Builder::default()
+        .manage(RecordState {
             is_recording: Arc::new(AtomicBool::new(false)),
         })
-    .setup(|app| {
-      if cfg!(debug_assertions) {
-        app.handle().plugin(
-          tauri_plugin_log::Builder::default()
-            .level(log::LevelFilter::Info)
-            .build(),
-        )?;
-      }
-      Ok(())
-    })
-    .invoke_handler(tauri::generate_handler![get_windows, capture_selected_window, start_record_window, stop_record_window, test_audio_record])
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+        .setup(|app| {
+            if cfg!(debug_assertions) {
+                app.handle().plugin(
+                    tauri_plugin_log::Builder::default()
+                        .level(log::LevelFilter::Info)
+                        .build(),
+                )?;
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_windows,
+            capture_selected_window,
+            start_record_window,
+            stop_record_window
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }
